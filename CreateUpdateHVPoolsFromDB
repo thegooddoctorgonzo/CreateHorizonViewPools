@@ -1,0 +1,239 @@
+#################################################################################################
+#This script check enrollment and build or adjust VM pools for classes that are marked as Virtual (Computer Assisted Component in Xenegrade) classes
+#Any enrollment in a virtual class and a pool will be built. 
+#Additional enrollments and the script will adjust the pool to the proper number
+
+
+#Start-Transcript -Path "C:\Scripts\CreateDeleteStudentADAccountsLog.txt" -Append
+
+Add-PSSnapin Vmware.view.broker
+Import-Module "C:\Scripts\FunctionsModules\Set-BCPoolHTMLAccess.ps1"
+
+
+####################use this to find number of VMs running on a host##########################
+$vms = Get-VM -Name 'PCS*' | Sort-Object -Property name 
+
+#########Holder to count number of VMs on each host
+$lab3 = 0
+$lab2 = 0
+
+foreach ($vm in $vms)
+{
+    if($vm.Powerstate -eq "PoweredOn" -or $vm.PowerState -eq "Suspended")
+    {
+        switch($vm.VMHost){
+        'pcs-lab3h1.cenet.coned.uah.edu'{$lab3++}
+        'pcs-lab2h1.cenet.coned.uah.edu'{$lab2++}
+        }
+    }
+}
+##############Assign target host for new pool############
+$targetHost = Get-VMHost -Name pcs-lab3h1.cenet.coned.uah.edu   #lab3 is default host unless it has more VMs than lab2
+if($lab3 > $lab2)
+{
+    $targetHost = Get-VMHost -Name pcs-lab2h1.cenet.coned.uah.edu   
+}
+
+Import-Module ActiveDirectory
+
+$OU = "OU=Users,OU=Labs,OU=Labs and Classrooms,DC=CENet,DC=coned,DC=uah,DC=edu" # does not change
+
+#Collects users that are in DL IT classes that use VMs, and CR students that use VMs that are between a week before assigned start date and 2 days past end date
+$DBServer="PCS-DB1"
+$DB="Xenegrade"
+$Query_SQL="SELECT  CourseID + SectionID as ID,
+                    CourseID,
+                    SectionID,
+                    CourseTitle,
+                    StartDate,
+                    EndDate,
+                    TotalEnroll,
+                    BranchID,
+                    Virtual
+                    FROM vPDClassroomEnrollment WHERE (CAST(CURRENT_TIMESTAMP AS DATE) BETWEEN DATEADD(d,-14,CAST(StartDate AS DATE)) AND DATEADD(d,14,CAST(EndDate AS DATE)) AND  Virtual = 1) "      
+                                      
+                    
+
+$conn_SQL=New-Object system.data.sqlclient.sqlconnection("Server=$DBServer;Database=$DB;Integrated Security=True")
+$da_SQL=New-Object system.data.sqlclient.sqldataadapter($Query_SQL,$conn_SQL)
+$dt_SQL=New-Object system.data.datatable
+
+#try the SQL connection if error then exit the script
+try
+{
+    $conn_SQL.Open()
+    [void]$da_SQL.fill($dt_SQL)
+    $conn_SQL.Close() 
+}
+catch
+{
+    Write-Host "Connect failed"
+    exit
+}
+
+#add a test user manually
+<#
+$newRow=$dt_SQL.NewRow()
+$newRow.PersonID="93495"
+$newRow.FName="Bob"
+$newRow.LName="Loblaw"
+$newRow.Email="nothing@MS.com"
+$newRow.SessionID="C2115027"
+$newRow.SessionTitle="Microsoft Project"
+$newRow.id="93475c2115037"
+$newRow.StartDate="1/1/15"
+$newRow.RoomNumber="202"
+$dt_SQL.Rows.Add($newRow)
+#>
+
+$dt_SQL.primarykey=$dt_SQL.columns[0]
+#assign table of current classes to array
+$Classes=$dt_SQL.Rows 
+
+#get current pools for classes
+$pools = Get-Pool -PoolType SviPersistent | Where-Object {$_.pool_id -notlike "*dl"}
+
+foreach($class in $classes)
+{
+    #if class has enough enrollment to create pool
+    if($class.TotalEnroll -gt 1)
+    {
+        #search for existing pools for classes with enrollment
+        foreach($pool in $pools)
+        {
+            #if($class.CourseID -eq $pool.pool_id)
+            if($pool.pool_id -like  $class.CourseID.Substring(0,2))
+            {
+                Write-Host "Match on "$pool.pool_id
+                #set new max VM count for existing class
+                if(($class.TotalEnroll + 1) -gt $pool.maximumCount)
+                {
+                    Update-AutomaticLinkedClonePool -MaximumCount $class.TotalEnroll
+                }
+            }
+            else
+            {
+                #no existing pool found - create new pool
+                if($class.CourseTitle -like "*2016*")
+                {
+                    $poolOS = "W100"
+                }
+                else
+                {
+                    $poolOS = "W63"
+                    
+                }
+
+                Switch -wildcard ($class.CourseTitle.ToUpper())
+                {
+                    "MICROSOFT ACCESS*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\access_prep.bat" ;$ClassType="Access"; break}
+                    "MICROSOFT EXCEL*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\excel_prep.bat" ; $ClassType="Excel"; break}
+                    "MICROSOFT WORD*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\word_prep.bat" ;$ClassType="Word";  break}
+                    "MICROSOFT OUTLOOK*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\outlook_prep.bat" ;$ClassType="Outlook"; break}
+                    "MICROSOFT POWERPOINT*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\powerpoint_prep.bat" ;$ClassType="PowerPoint"; break}
+                    "*MICROSOFT PROJECT*" {$VDGName = "VDG" + $poolOS + "O1"; $postSyncScript = "C:\scripts\project_prep.bat" ; $ClassType="Project";break}
+                    "USING MICROSOFT SHAREPOINT*" {$VDGName = "VDG" + $poolOS + "O1" ; $postSyncScript = "C:\scripts\sharepoint_prep.bat" ; $ClassType="Sharepoint"; break}
+                    "*JAVA*" {$VDGName = "VDG" + $poolOS + "JAVA" ;$postSyncScript = "C:\scripts\office_prep.bat" ; $ClassType="Java";  break}
+                    "*C++*" {$VDGName = "VDG" + $poolOS + "CPP" ;$postSyncScript = "C:\scripts\cpp_prep.bat" ;$ClassType="CPP";  break}
+                    #"*PHOTOSHOP*" {$VDGName = "VDG" + $poolOS + "" ;$ClassType="PhotoShop"; break}
+                    "*SKETCHUP*" {$VDGName = "VDG" + $poolOS + "SKETCH" ;$postSyncScript = "C:\scripts\sketchup_prep.bat" ;$ClassType="SketchUp"; break}
+                    "QUICKBOOKS*" {$VDGName = "VDG" + $poolOS + "QB" ; $postSyncScript = "C:\scripts\office_prep.bat" ; $ClassType="QuickBooks"; break}
+                    "*MATLAB*" {$VDGName = "VDG" + $poolOS + "MATLAB" ; $postSyncScript = "C:\scripts\matlab_prep.bat" ;$ClassType="MatLab"; break}
+                    "*DOORS*" {$VDGName = "VDG" + $poolOS + "DOORS" ; $postSyncScript = "C:\scripts\office_prep.bat" ;$ClassType="DOORS"; break}
+                    "*SYSML*" {$VDGName = "VDG" + $poolOS + "CAMEO" ; $postSyncScript = "C:\scripts\office_prep.bat" ; $ClassType="Magic Draw"; break}
+                    "Network+*" {$VDGName = "VDG" + $poolOS + "NET" ; $postSyncScript = "C:\scripts\office_prep.bat" ;$ClassType="Cert"; break}
+                    #"Security+*" {$VDGName = "VDG" + $poolOS + "" ; $ClassType="Cert"; break}
+                    "*PYTHON*" {$VDGName = "VDG" + $poolOS + "PYTHON" ; $postSyncScript = "C:\scripts\python_prep.bat" ; $ClassType="Python"; break}
+                    default {$VDGName = "VDGW100O16" ; $postSyncScript = "C:\scripts\office_prep.bat" ;break}
+                }
+
+                #get correct VDG or group of VDGs
+                $VDGObj = Get-VM -Name "VDG*" | Where-Object {$_.Name -like $VDGName -and $_.Name -notlike "*OLD*"} | Select-Object *
+
+               <#  if($VDGObj.Count > 1)
+                {
+                    #will get the latest HW version of multiple found VDGs
+                    #VDG names need v10, v11, etc appended to the end
+                    $VDGObj = $VDGObj | Sort-Object -Property Name
+                    $VDGObj = $VDGObj[$VDGObj.Count - 1]
+                } #>
+
+                #assign path to most current VDG - using $VDGObj[$VDGObj.Count - 1] after sort points to highest HW ver
+                $parentVMPath = "/PCS Virtual Desktops/vm/" + $VDGObj[$VDGObj.Count - 1].Folder + "/" + $VDGObj.Name
+
+                #get snapshots for VDG
+                $snapObj = Get-Snapshot -VM $VDGObj.name | Sort-Object name
+
+                #builds path to SS
+                foreach($snap in $snapObj)
+                {
+                    #build root path
+                    $parentSnapPath  = $parentSnapPath +$snap.ParentSnapshot + "/"
+                    if($snap -eq $snapObj[$snapObj.Count - 1])
+                    {
+                        #add on name of SS to path
+                        $parentSnapPath  = $parentSnapPath + $snap.Name
+                    }
+                }
+                
+                #assign resource pool - same as host
+                $resourcePoolPath = "/PCS Virtual Desktops/host/" + $targetHost.Name + "/Resources"
+                #assigns datastore for OS
+                $OSStorage = Get-Datastore -RelatedObject $targetHost -Name "*_OS_*"
+                #datastore for persistent disc
+                $persistentStorage = Get-Datastore -RelatedObject $targetHost -Name "*_Per*"
+                #datastore specs
+                $dataStoreSpecs = "[Aggressive,data]/PCS Virtual Desktops/host/" + $targetHost.Name + "/" + $persistentStorage.name + ";[Aggressive,OS]/PCS Virtual Desktops/host/" + $targetHost.Name + "/" + $OSStorage
+                #name of clones will be the same as the CourseID
+                $namePrefix = "PCS" + $class.CourseID + "{n:fixed=2}"
+                $description = "Pool created by CreateNewPoolfromXen script on " + (Get-Date).ToString()
+                
+                Add-AutomaticLinkedClonePool -Pool_id $class.CourseID `
+                                             -DisplayName $class.CourseTitle `
+                                             -Vc_id 'fa56cb89-bf14-450a-bc59-644e9872c2cd' `
+                                             -FolderId 'Class pools' `
+                                             -Persistence Persistent `
+                                             -VmFolderPath /PCS Virtual Desktops/vm/LinkedClones `
+                                             -ResourcePoolPath $resourcePoolPath `
+                                             -ParentVmPath $parentVMPath `
+                                             -ParentSnapshotPath $parentSnapPath `
+                                             -DatastoreSpecs $dataStoreSpecs `
+                                             -Composer_ad_id 'f1b72e8f-9c63-46fa-8da0-011bfba047ab' `
+                                             -OrganizationalUnit 'OU=Virtual,OU=Desktops,OU=Labs,OU=Labs and Classrooms' `
+                                             -PostSyncScript $postSyncScript `
+                                             -MinimumCount $class.TotalEnroll + 1 `
+                                             -MaximumCount $class.TotalEnroll + 1 `
+                                             -RefreshPolicyType Never `
+                                             -NamePrefix $namePrefix `
+                                             -PowerPolicy Suspend `
+                                             -IsUserResetAllowed $true `
+                                             -SuspendProvisioningOnError $true `
+                                             -AutoLogoffTime 120 `
+                                             -DefaultProtocol PCOIP `
+                                             -AllowMultipleSessions $false `
+                                             -AllowProtocolOverride $false `
+                                             -FlashQuality NO_CONTROL `
+                                             -FlashThrottling DISABLED `
+                                             -IsProvisioningEnabled $true `
+                                             -UseUserDataDisk $true `
+                                             -DataDiskLetter D `
+                                             -DataDiskSize 2048 `
+                                             -UseTempDisk $true `
+                                             -TempDiskSize 4096 `
+                                             -Description $description `
+                                             -UseSeSparseDiskFormat $true `
+                                             -HeadroomCount 1 `
+                                             -SeSparseThreshold 0 
+
+                    $EntitleIns = Get-ADUser -Filter {Name -like $name} -SearchBase "OU=Instructors,OU=Users,OU=Labs,OU=Labs and Classrooms,DC=CENet,DC=coned,DC=uah,DC=edu"
+                    $EntitleGroup = Get-ADGroup -Identity "$ClassType Students"  -SearchBase "OU=Labs,OU=Labs and Classrooms,DC=CENet,DC=coned,DC=uah,DC=edu"
+                    Add-PoolEntitlement -Pool_id $class.CourseID -Sid $EntitleGroup.SID 
+                    Add-PoolEntitlement -Pool_id $class.CourseID -Sid $EntitleIns.SID 
+
+                    Set-BCPoolHtmlAccess $class.CourseID $true
+                                                                                
+        }
+    }
+    }
+}
+    
