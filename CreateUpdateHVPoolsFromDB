@@ -22,16 +22,16 @@ foreach ($vm in $vms)
     if($vm.Powerstate -eq "PoweredOn" -or $vm.PowerState -eq "Suspended")
     {
         switch($vm.VMHost){
-        'pcs-lab3h1.cenet.coned.uah.edu'{$lab3++}
-        'pcs-lab2h1.cenet.coned.uah.edu'{$lab2++}
+        'VMHOST'{$lab3++}
+        'VMHOST'{$lab2++}
         }
     }
 }
 ##############Assign target host for new pool############
-$targetHost = Get-VMHost -Name pcs-lab3h1.cenet.coned.uah.edu   #lab3 is default host unless it has more VMs than lab2
+$targetHost = Get-VMHost -Name VMHOST   #lab3 is default host unless it has more VMs than lab2
 if($lab3 > $lab2)
 {
-    $targetHost = Get-VMHost -Name pcs-lab2h1.cenet.coned.uah.edu   
+    $targetHost = Get-VMHost -Name VMHOST  
 }
 
 Import-Module ActiveDirectory
